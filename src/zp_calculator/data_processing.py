@@ -15,6 +15,9 @@ __all__ = [
     "load_reconciliation_file",
     "aggregate_by_partner_and_buyer",
     "aggregate_overall",
+    "load_expenses_file",
+    "aggregate_expenses_by_buyer",
+    "aggregate_expenses_totals",
 ]
 
 SPACE_PATTERN = re.compile(r"[\s\u00A0\u202F]")
@@ -85,6 +88,10 @@ def _normalize_numeric(value: str | float | int | None) -> str:
     cleaned = cleaned.replace("\u2212", "-")  # minus sign variant
     cleaned = cleaned.replace(",", ".")
     cleaned = cleaned.replace('"', "")
+    lowered = cleaned.lower()
+    for token in ("usd", "uah", "byn", "eur", "rub", "₽", "руб", "som", "kzt"):
+        lowered = lowered.replace(token, "")
+    cleaned = lowered.replace("$", "").replace("€", "").replace("£", "")
     return cleaned.strip()
 
 
@@ -335,3 +342,153 @@ def _first_non_null(values: Iterable[Optional[str]]) -> Optional[str]:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _has_non_empty(values: Iterable[Optional[str]]) -> bool:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def load_expenses_file(
+    file_obj: io.BufferedIOBase | io.BytesIO | io.StringIO | io.TextIOBase,
+    source_name: Optional[str] = None,
+) -> pd.DataFrame:
+    """Parse expense spreadsheet exported as CSV.
+
+    Returns columns: buyer, expense_type, item_count, amount, source_file, notes.
+    """
+
+    text = _read_text(file_obj)
+    csv_reader = csv.reader(io.StringIO(text))
+    rows = [row for row in csv_reader]
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["buyer", "expense_type", "item_count", "amount", "source_file", "notes"]
+        )
+
+    width = max(len(row) for row in rows)
+    normalized_rows = [row + [""] * (width - len(row)) for row in rows]
+    raw = pd.DataFrame(normalized_rows, dtype=str).fillna("")
+
+    records: list[dict[str, object]] = []
+
+    for row_idx in range(1, raw.shape[0]):
+        header_row = raw.iloc[row_idx]
+        if not any(str(cell).strip().lower() == "байер" for cell in header_row):
+            continue
+
+        section_row = raw.iloc[row_idx - 1] if row_idx > 0 else pd.Series(dtype=str)
+
+        for col_idx, cell in header_row.items():
+            if str(cell).strip().lower() != "байер":
+                continue
+
+            expense_type = str(section_row.iloc[col_idx]).strip() if col_idx < len(section_row) else ""
+            if not expense_type:
+                continue
+
+            count_col = col_idx + 1
+            amount_col = col_idx + 2
+            note_col = col_idx + 3 if col_idx + 3 < raw.shape[1] else None
+
+            data_row_idx = row_idx + 1
+            while data_row_idx < raw.shape[0]:
+                buyer_raw = str(raw.iat[data_row_idx, col_idx]).strip() if col_idx < raw.shape[1] else ""
+                count_raw = (
+                    str(raw.iat[data_row_idx, count_col]).strip()
+                    if count_col < raw.shape[1]
+                    else ""
+                )
+                amount_raw = (
+                    str(raw.iat[data_row_idx, amount_col]).strip()
+                    if amount_col < raw.shape[1]
+                    else ""
+                )
+                note_raw = (
+                    str(raw.iat[data_row_idx, note_col]).strip()
+                    if note_col is not None and note_col < raw.shape[1]
+                    else ""
+                )
+
+                if not _has_non_empty([buyer_raw, count_raw, amount_raw]):
+                    break
+
+                normalized_buyer = buyer_raw.replace("\u00A0", " ").strip()
+                if not normalized_buyer:
+                    data_row_idx += 1
+                    continue
+
+                lowered_buyer = normalized_buyer.lower()
+                if any(lowered_buyer.startswith(prefix.lower()) for prefix in SUMMARY_ROW_PREFIXES):
+                    break
+
+                item_count = _parse_float(count_raw)
+                amount_value = _parse_float(amount_raw)
+
+                records.append(
+                    {
+                        "buyer": normalized_buyer,
+                        "expense_type": expense_type,
+                        "item_count": item_count,
+                        "amount": amount_value,
+                        "source_file": source_name or getattr(file_obj, "name", "uploaded"),
+                        "notes": note_raw,
+                    }
+                )
+
+                data_row_idx += 1
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df["item_count"] = pd.to_numeric(df["item_count"], errors="coerce").fillna(0.0)
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+
+    if (df["item_count"] % 1 == 0).all():
+        df["item_count"] = df["item_count"].astype(int)
+
+    df["amount"] = df["amount"].round(2)
+    return df.reset_index(drop=True)
+
+
+def aggregate_expenses_by_buyer(expense_details: pd.DataFrame) -> pd.DataFrame:
+    if expense_details.empty:
+        return expense_details
+
+    grouped = (
+        expense_details.groupby(["buyer", "expense_type"], dropna=False)
+        .agg(item_count=("item_count", "sum"), amount=("amount", "sum"))
+        .reset_index()
+    )
+
+    if (grouped["item_count"] % 1 == 0).all():
+        grouped["item_count"] = grouped["item_count"].astype(int)
+    grouped["amount"] = grouped["amount"].round(2)
+
+    return grouped.sort_values(["buyer", "expense_type"]).reset_index(drop=True)
+
+
+def aggregate_expenses_totals(expense_details: pd.DataFrame) -> pd.DataFrame:
+    if expense_details.empty:
+        return expense_details
+
+    grouped = (
+        expense_details.groupby("buyer", dropna=False)
+        .agg(
+            total_amount=("amount", "sum"),
+            total_items=("item_count", "sum"),
+            expense_types=("expense_type", "nunique"),
+            entries=("expense_type", "count"),
+        )
+        .reset_index()
+    )
+
+    grouped["total_amount"] = grouped["total_amount"].round(2)
+    if (grouped["total_items"] % 1 == 0).all():
+        grouped["total_items"] = grouped["total_items"].astype(int)
+
+    return grouped.sort_values(["total_amount", "buyer"], ascending=[False, True]).reset_index(drop=True)

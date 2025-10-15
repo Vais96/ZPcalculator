@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+import sys
 from io import BytesIO
 from pathlib import Path
-import sys
 
 import pandas as pd
 import streamlit as st
+from streamlit.delta_generator import DeltaGenerator
 
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
@@ -15,7 +16,10 @@ if SRC_DIR.exists():
 
 from zp_calculator.data_processing import (
     aggregate_by_partner_and_buyer,
+    aggregate_expenses_by_buyer,
+    aggregate_expenses_totals,
     aggregate_overall,
+    load_expenses_file,
     load_reconciliation_file,
 )
 
@@ -65,198 +69,188 @@ def infer_partner_program(filename: str) -> str:
     cleaned = cleaned.strip()
     return cleaned or stem.strip()
 
-st.set_page_config(
-    page_title="ZP Calculator",
-    layout="wide",
-)
 
-st.title("🧾 Сводная по байерам из файлов сверок")
-st.caption(
-    "Загрузите один или несколько CSV-файлов сверок, чтобы получить агрегированную таблицу по байерам."
-)
-
-with st.sidebar:
-    st.header("Правила импорта")
-    st.markdown(
-        """
-        * Принимаются файлы в формате CSV (UTF-8).
-        * Из данных используются колонки **Buyer**, **Commision/Commission Type**, **Сумма по полю FTD Count**, **Сумма по полю Payout**.
-        * "Всего" и "Итого" строки игнорируются — totals считаются заново.
-        """
+def render_reconciliation_module(sidebar: DeltaGenerator) -> None:
+    st.subheader("🧾 Сводная по байерам из файлов сверок")
+    st.caption(
+        "Загрузите один или несколько CSV-файлов сверок, чтобы получить агрегированную таблицу по байерам."
     )
 
-uploaded_files = st.file_uploader(
-    "Загрузите CSV-файлы", type=["csv"], accept_multiple_files=True
-)
-
-if not uploaded_files:
-    st.info("Добавьте один или несколько CSV-файлов, чтобы увидеть результат.")
-    st.stop()
-
-all_details: list[pd.DataFrame] = []
-errors: list[str] = []
-
-for uploaded in uploaded_files:
-    partner_program = infer_partner_program(uploaded.name)
-    try:
-        details = load_reconciliation_file(uploaded, partner_program, source_name=uploaded.name)
-    except Exception as exc:  # pragma: no cover - отображение ошибки для пользователя
-        errors.append(f"{uploaded.name}: {exc}")
-        continue
-
-    if details.empty:
-        errors.append(f"{uploaded.name}: не удалось извлечь данные")
-        continue
-
-    all_details.append(details)
-
-if errors:
-    st.warning("\n".join(errors))
-
-if not all_details:
-    st.error("Не получилось прочитать данные ни из одного файла.")
-    st.stop()
-
-combined_details = pd.concat(all_details, ignore_index=True)
-combined_details["partner_program"] = combined_details["partner_program"].astype(str)
-combined_details["buyer"] = combined_details["buyer"].astype(str)
-combined_details["currency"] = (
-    combined_details["currency"].fillna("USD").replace("", "USD").astype(str).str.upper()
-)
-
-available_currencies = sorted(
-    {
-        currency
-        for currency in combined_details["currency"].unique()
-        if isinstance(currency, str) and currency and currency != "NAN"
-    }
-)
-if not available_currencies:
-    available_currencies = ["USD"]
-
-st.sidebar.subheader("Курсы валют → $")
-st.sidebar.caption("Введите, сколько долларов соответствует 1 единице валюты партнёрской программы.")
-exchange_rates: dict[str, float] = {}
-for currency in available_currencies:
-    default_rate = 1.0 if currency == "USD" else 1.0
-    exchange_rates[currency] = st.sidebar.number_input(
-        f"{currency} → USD",
-        min_value=0.0,
-        value=float(default_rate),
-        step=0.01,
-        format="%.4f",
-        key=f"rate_{currency}",
+    uploaded_files = st.file_uploader(
+        "Загрузите CSV-файлы",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="reconciliation_files",
     )
 
-exchange_rates.setdefault("USD", 1.0)
+    if not uploaded_files:
+        st.info("Добавьте один или несколько CSV-файлов, чтобы увидеть результат.")
+        return
 
-partner_options = sorted(combined_details["partner_program"].unique())
-selected_programs = st.multiselect(
-    "Партнерские программы",
-    options=partner_options,
-    default=partner_options,
-)
-filtered_details = combined_details[combined_details["partner_program"].isin(selected_programs)]
+    all_details: list[pd.DataFrame] = []
+    errors: list[str] = []
 
-buyer_options = sorted(filtered_details["buyer"].unique())
-selected_buyers = st.multiselect(
-    "Байеры",
-    options=buyer_options,
-    default=buyer_options,
-)
-filtered_details = filtered_details[filtered_details["buyer"].isin(selected_buyers)]
+    for uploaded in uploaded_files:
+        partner_program = infer_partner_program(uploaded.name)
+        try:
+            details = load_reconciliation_file(uploaded, partner_program, source_name=uploaded.name)
+        except Exception as exc:  # pragma: no cover - отображение ошибки для пользователя
+            errors.append(f"{uploaded.name}: {exc}")
+            continue
 
-if filtered_details.empty:
-    st.warning("По выбранным фильтрам нет данных.")
-    st.stop()
+        if details.empty:
+            errors.append(f"{uploaded.name}: не удалось извлечь данные")
+            continue
 
-st.subheader("Детальные строки")
-st.dataframe(
-    filtered_details[
-        [
-            "partner_program",
-            "buyer",
-            "commission_type",
-            "ftd_count",
-            "payout",
-            "currency",
-            "is_chargeback",
-            "source_file",
+        all_details.append(details)
+
+    if errors:
+        st.warning("\n".join(errors))
+
+    if not all_details:
+        st.error("Не получилось прочитать данные ни из одного файла.")
+        return
+
+    combined_details = pd.concat(all_details, ignore_index=True)
+    combined_details["partner_program"] = combined_details["partner_program"].astype(str)
+    combined_details["buyer"] = combined_details["buyer"].astype(str)
+    combined_details["currency"] = (
+        combined_details["currency"].fillna("USD").replace("", "USD").astype(str).str.upper()
+    )
+
+    available_currencies = sorted(
+        {
+            currency
+            for currency in combined_details["currency"].unique()
+            if isinstance(currency, str) and currency and currency != "NAN"
+        }
+    )
+    if not available_currencies:
+        available_currencies = ["USD"]
+
+    sidebar.subheader("Курсы валют → $")
+    sidebar.caption("Введите, сколько долларов соответствует 1 единице валюты партнёрской программы.")
+    exchange_rates: dict[str, float] = {}
+    for currency in available_currencies:
+        exchange_rates[currency] = sidebar.number_input(
+            f"{currency} → USD",
+            min_value=0.0,
+            value=1.0,
+            step=0.01,
+            format="%.4f",
+            key=f"rate_{currency}",
+        )
+
+    exchange_rates.setdefault("USD", 1.0)
+
+    partner_options = sorted(combined_details["partner_program"].unique())
+    selected_programs = st.multiselect(
+        "Партнерские программы",
+        options=partner_options,
+        default=partner_options,
+    )
+    filtered_details = combined_details[combined_details["partner_program"].isin(selected_programs)]
+
+    buyer_options = sorted(filtered_details["buyer"].unique())
+    selected_buyers = st.multiselect(
+        "Байеры",
+        options=buyer_options,
+        default=buyer_options,
+    )
+    filtered_details = filtered_details[filtered_details["buyer"].isin(selected_buyers)]
+
+    if filtered_details.empty:
+        st.warning("По выбранным фильтрам нет данных.")
+        return
+
+    st.subheader("Детальные строки")
+    st.dataframe(
+        filtered_details[
+            [
+                "partner_program",
+                "buyer",
+                "commission_type",
+                "ftd_count",
+                "payout",
+                "currency",
+                "is_chargeback",
+                "source_file",
+            ]
         ]
-    ]
-)
+    )
 
-summary = aggregate_by_partner_and_buyer(filtered_details)
-summary["currency"] = summary["currency"].fillna("USD").replace("", "USD").str.upper()
-summary["conversion_rate"] = summary["currency"].apply(lambda cur: resolve_rate(cur, exchange_rates))
-summary["payout_usd"] = (summary["payout"] * summary["conversion_rate"]).round(2)
-summary["chargeback_amount_usd"] = (
-    summary["chargeback_amount"] * summary["conversion_rate"]
-).round(2)
-summary["net_payout_usd"] = (summary["net_payout"] * summary["conversion_rate"]).round(2)
+    summary = aggregate_by_partner_and_buyer(filtered_details)
+    summary["currency"] = summary["currency"].fillna("USD").replace("", "USD").str.upper()
+    summary["conversion_rate"] = summary["currency"].apply(lambda cur: resolve_rate(cur, exchange_rates))
+    summary["payout_usd"] = (summary["payout"] * summary["conversion_rate"]).round(2)
+    summary["chargeback_amount_usd"] = (
+        summary["chargeback_amount"] * summary["conversion_rate"]
+    ).round(2)
+    summary["net_payout_usd"] = (summary["net_payout"] * summary["conversion_rate"]).round(2)
 
-st.subheader("Сводка по партнерским программам и байерам")
-st.dataframe(
-    summary[
-        [
-            "partner_program",
-            "buyer",
-            "deposits",
-            "chargebacks",
-            "net_deposits",
-            "payout",
-            "payout_usd",
-            "chargeback_amount",
-            "chargeback_amount_usd",
-            "net_payout",
-            "net_payout_usd",
-            "currency",
+    st.subheader("Сводка по партнерским программам и байерам")
+    st.dataframe(
+        summary[
+            [
+                "partner_program",
+                "buyer",
+                "deposits",
+                "chargebacks",
+                "net_deposits",
+                "payout",
+                "payout_usd",
+                "chargeback_amount",
+                "chargeback_amount_usd",
+                "net_payout",
+                "net_payout_usd",
+                "currency",
+            ]
         ]
-    ]
-)
-create_download_button("Скачать сводку по программам", summary, "partner_summary.csv")
+    )
+    create_download_button("Скачать сводку по программам", summary, "partner_summary.csv")
 
-overall = aggregate_overall(summary)
-overall["currency"] = overall["currency"].fillna("USD").replace("", "USD").str.upper()
-overall["conversion_rate"] = overall["currency"].apply(lambda cur: resolve_rate(cur, exchange_rates))
-overall["payout_usd"] = (overall["payout"] * overall["conversion_rate"]).round(2)
-overall["chargeback_amount_usd"] = (
-    overall["chargeback_amount"] * overall["conversion_rate"]
-).round(2)
-overall["net_payout_usd"] = (overall["net_payout"] * overall["conversion_rate"]).round(2)
+    overall = aggregate_overall(summary)
+    overall["currency"] = overall["currency"].fillna("USD").replace("", "USD").str.upper()
+    overall["conversion_rate"] = overall["currency"].apply(lambda cur: resolve_rate(cur, exchange_rates))
+    overall["payout_usd"] = (overall["payout"] * overall["conversion_rate"]).round(2)
+    overall["chargeback_amount_usd"] = (
+        overall["chargeback_amount"] * overall["conversion_rate"]
+    ).round(2)
+    overall["net_payout_usd"] = (overall["net_payout"] * overall["conversion_rate"]).round(2)
 
-st.subheader("Общая сводка по байерам")
-st.dataframe(
-    overall[
-        [
-            "buyer",
-            "currency",
-            "deposits",
-            "chargebacks",
-            "net_deposits",
-            "payout",
-            "payout_usd",
-            "chargeback_amount",
-            "chargeback_amount_usd",
-            "net_payout",
-            "net_payout_usd",
-            "partner_program",
+    st.subheader("Общая сводка по байерам")
+    st.dataframe(
+        overall[
+            [
+                "buyer",
+                "currency",
+                "deposits",
+                "chargebacks",
+                "net_deposits",
+                "payout",
+                "payout_usd",
+                "chargeback_amount",
+                "chargeback_amount_usd",
+                "net_payout",
+                "net_payout_usd",
+                "partner_program",
+            ]
         ]
-    ]
-)
-create_download_button("Скачать общую сводку", overall, "overall_summary.csv")
+    )
+    create_download_button("Скачать общую сводку", overall, "overall_summary.csv")
 
-buyer_detail_options = sorted(summary["buyer"].unique())
+    buyer_detail_options = sorted(summary["buyer"].unique())
 
-if buyer_detail_options:
-    st.subheader("Отчет по выбранному байеру")
-    buyer_for_report = st.selectbox("Выберите байера для отдельной выгрузки", buyer_detail_options)
+    if buyer_detail_options:
+        st.subheader("Отчет по выбранному байеру")
+        buyer_for_report = st.selectbox("Выберите байера для отдельной выгрузки", buyer_detail_options)
 
-    buyer_summary = summary[summary["buyer"] == buyer_for_report].copy()
+        buyer_summary = summary[summary["buyer"] == buyer_for_report].copy()
 
-    if buyer_summary.empty:
-        st.info("Для выбранного байера нет данных после применения фильтров.")
-    else:
+        if buyer_summary.empty:
+            st.info("Для выбранного байера нет данных после применения фильтров.")
+            return
+
         offers_table = buyer_summary[
             ["partner_program", "deposits", "payout", "payout_usd", "net_payout", "net_payout_usd"]
         ].rename(
@@ -326,3 +320,187 @@ if buyer_detail_options:
                 chargebacks_table,
                 f"buyer_chargebacks_{buyer_for_report}.csv",
             )
+
+
+def render_expenses_module(sidebar: DeltaGenerator) -> None:
+    st.subheader("💸 Расходники по байерам")
+    st.caption("Загрузите CSV с расходами — модуль объединит блоки и посчитает итоги по байерам.")
+
+    uploaded_files = st.file_uploader(
+        "Загрузите CSV-файлы расходников",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="expenses_files",
+    )
+
+    if not uploaded_files:
+        st.info("Добавьте хотя бы один CSV-файл, чтобы увидеть данные по расходам.")
+        return
+
+    expense_frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    for uploaded in uploaded_files:
+        try:
+            details = load_expenses_file(uploaded, source_name=uploaded.name)
+        except Exception as exc:  # pragma: no cover - отображение ошибки для пользователя
+            errors.append(f"{uploaded.name}: {exc}")
+            continue
+
+        if details.empty:
+            errors.append(f"{uploaded.name}: не удалось извлечь данные")
+            continue
+
+        expense_frames.append(details)
+
+    if errors:
+        st.warning("\n".join(errors))
+
+    if not expense_frames:
+        st.error("Не удалось получить данные ни из одного файла расходников.")
+        return
+
+    combined = pd.concat(expense_frames, ignore_index=True)
+    combined["amount"] = combined["amount"].astype(float).round(2)
+
+    buyer_options = sorted(combined["buyer"].unique())
+    selected_buyers = st.multiselect(
+        "Байеры (расходы)",
+        options=buyer_options,
+        default=buyer_options,
+        key="expense_buyers",
+    )
+
+    type_options = sorted(combined["expense_type"].unique())
+    selected_types = st.multiselect(
+        "Типы расходов",
+        options=type_options,
+        default=type_options,
+        key="expense_types",
+    )
+
+    filtered = combined[
+        combined["buyer"].isin(selected_buyers) & combined["expense_type"].isin(selected_types)
+    ]
+
+    if filtered.empty:
+        st.warning("По выбранным фильтрам нет данных.")
+        return
+
+    detail_display = filtered.rename(
+        columns={
+            "buyer": "Байер",
+            "expense_type": "Тип расхода",
+            "item_count": "Кол-во",
+            "amount": "Сумма, $",
+            "source_file": "Источник",
+            "notes": "Комментарий",
+        }
+    )
+
+    st.subheader("Детальная таблица расходов")
+    st.dataframe(detail_display, use_container_width=True)
+    create_download_button("Скачать детализацию расходников", detail_display, "expenses_details.csv")
+
+    by_type = aggregate_expenses_by_buyer(filtered)
+    by_type_display = by_type.rename(
+        columns={
+            "buyer": "Байер",
+            "expense_type": "Тип расхода",
+            "item_count": "Кол-во",
+            "amount": "Сумма, $",
+        }
+    )
+    st.subheader("Сводка по типам расходов")
+    st.dataframe(by_type_display, use_container_width=True)
+    create_download_button("Скачать сводку по типам", by_type_display, "expenses_by_type.csv")
+
+    totals = aggregate_expenses_totals(filtered)
+    totals_display = totals.rename(
+        columns={
+            "buyer": "Байер",
+            "total_amount": "Всего, $",
+            "total_items": "Кол-во позиций",
+            "expense_types": "Типов расходов",
+            "entries": "Строк",
+        }
+    )
+
+    numeric_columns = ["Всего, $", "Кол-во позиций", "Типов расходов", "Строк"]
+    for column in numeric_columns[1:]:
+        if column in totals_display.columns:
+            totals_display[column] = totals_display[column].astype(int)
+    totals_display["Всего, $"] = totals_display["Всего, $"].round(2)
+    totals_display = append_total_row(totals_display, "Сумма", numeric_columns)
+
+    st.subheader("Итого по байерам")
+    st.dataframe(totals_display, use_container_width=True)
+    create_download_button("Скачать итоги по байерам", totals_display, "expenses_totals.csv")
+
+    sidebar.subheader("Быстрые метрики")
+    total_spent = filtered["amount"].sum()
+    unique_buyers = filtered["buyer"].nunique()
+    sidebar.metric("Расходов всего, $", f"{total_spent:,.2f}")
+    sidebar.metric("Активных байеров", unique_buyers)
+
+    buyer_expense_options = sorted(filtered["buyer"].unique())
+    if buyer_expense_options:
+        st.subheader("Отчет по расходам выбранного байера")
+        buyer_for_expenses = st.selectbox(
+            "Выберите байера (расходы)",
+            options=buyer_expense_options,
+            key="expense_buyer_report",
+        )
+
+        buyer_expenses = filtered[filtered["buyer"] == buyer_for_expenses].copy()
+
+        if buyer_expenses.empty:
+            st.info("Для выбранного байера нет записей после фильтрации.")
+        else:
+            buyer_detail = buyer_expenses.rename(
+                columns={
+                    "expense_type": "Тип расхода",
+                    "item_count": "Кол-во",
+                    "amount": "Сумма, $",
+                    "notes": "Комментарий",
+                    "source_file": "Источник",
+                }
+            )[
+                ["Тип расхода", "Кол-во", "Сумма, $", "Комментарий", "Источник"]
+            ]
+            buyer_detail = append_total_row(buyer_detail, "Сумма", ["Кол-во", "Сумма, $"])
+
+            st.dataframe(buyer_detail, use_container_width=True)
+            create_download_button(
+                f"Скачать расходник — {buyer_for_expenses}",
+                buyer_detail,
+                f"expenses_{buyer_for_expenses}.csv",
+            )
+
+st.set_page_config(page_title="ZP Calculator", layout="wide")
+
+sidebar = st.sidebar
+module = sidebar.radio("Выберите модуль", ["Сверки", "Расходники"], index=0)
+
+if module == "Сверки":
+    sidebar.header("Правила импорта сверок")
+    sidebar.markdown(
+        """
+        * Принимаются файлы в формате CSV (UTF-8).
+        * Необходимые колонки: **Buyer**, **Commision/Commission Type**, **FTD Count**, **Payout**.
+        * Строки "Всего" и "Итого" игнорируются — итог пересчитывается автоматически.
+        """
+    )
+    st.title("ZP Calculator — Сверки")
+    render_reconciliation_module(sidebar)
+else:
+    sidebar.header("Правила импорта расходников")
+    sidebar.markdown(
+        """
+        * Экспортируйте таблицу с расходами в CSV (UTF-8, без объединённых ячеек).
+        * Для каждого блока должны быть заголовки "Байер", "Кол-во", "Сумма" по типу расхода.
+        * Строки "Итого" и "Всего" пропускаются автоматически.
+        """
+    )
+    st.title("ZP Calculator — Расходники")
+    render_expenses_module(sidebar)

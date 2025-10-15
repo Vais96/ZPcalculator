@@ -5,6 +5,9 @@ import io
 from zp_calculator.data_processing import (
     aggregate_by_partner_and_buyer,
     aggregate_overall,
+    aggregate_expenses_by_buyer,
+    aggregate_expenses_totals,
+    load_expenses_file,
     load_reconciliation_file,
 )
 
@@ -89,3 +92,33 @@ def test_load_handles_missing_commission_column():
     assert summary_row["deposits"] == 41
     assert summary_row["payout"] == 7380.0
     assert summary_row["net_payout"] == 7380.0
+
+
+def test_load_expenses_file_and_aggregate():
+    csv_content = (
+        ",Фанки,,,,Рекламные аккаунты,,\n"
+        ",Байер,Кол-во,Сумма,,Байер,Кол-во,Сумма,\n"
+        ",Arseniy Simich,3,\"$359,00\",,Arseniy Simich,1,\"$45,00\",\n"
+        ",Итого:,3,\"$359,00\",,Итого:,1,\"$45,00\",\n"
+        ",Прокси,,,\n"
+        ",Байер,Кол-во,Сумма,\n"
+        ",Arseniy Simich,2,\"$12,00\",\n"
+        ",Итого:,2,\"$12,00\",\n"
+    )
+
+    data = load_expenses_file(io.StringIO(csv_content), source_name="expenses.csv")
+
+    assert len(data) == 3
+    assert set(data["expense_type"]) == {"Фанки", "Рекламные аккаунты", "Прокси"}
+
+    grouped = aggregate_expenses_by_buyer(data)
+    assert len(grouped) == 3
+    funk_row = grouped[grouped["expense_type"] == "Фанки"].iloc[0]
+    assert funk_row["item_count"] == 3
+    assert funk_row["amount"] == 359.0
+
+    totals = aggregate_expenses_totals(data)
+    assert len(totals) == 1
+    total_row = totals.iloc[0]
+    assert total_row["buyer"] == "Arseniy Simich"
+    assert total_row["total_amount"] == 416.0
