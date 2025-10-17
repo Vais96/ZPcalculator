@@ -191,25 +191,75 @@ def render_reconciliation_module(sidebar: DeltaGenerator) -> None:
     summary["net_payout_usd"] = (summary["net_payout"] * summary["conversion_rate"]).round(2)
 
     st.subheader("Сводка по партнерским программам и байерам")
-    st.dataframe(
-        summary[
-            [
-                "partner_program",
-                "buyer",
-                "deposits",
-                "chargebacks",
-                "net_deposits",
-                "payout",
-                "payout_usd",
-                "chargeback_amount",
-                "chargeback_amount_usd",
-                "net_payout",
-                "net_payout_usd",
-                "currency",
-            ]
-        ]
+
+    primary_summary_columns = [
+        "buyer",
+        "partner_program",
+        "deposits",
+        "payout",
+        "payout_usd",
+    ]
+    summary_download_columns = primary_summary_columns + [
+        column for column in summary.columns if column not in primary_summary_columns
+    ]
+    summary_download = summary[summary_download_columns].copy()
+
+    summary_display = summary_download.rename(
+        columns={
+            "buyer": "Байер",
+            "partner_program": "Партнерская программа",
+            "deposits": "Депозитов",
+            "payout": "Ревеню в валюте ПП",
+            "payout_usd": "Ревеню в USD",
+            "chargebacks": "Чарджбеков",
+            "chargeback_amount": "Чардж в валюте ПП",
+            "chargeback_amount_usd": "Чардж в USD",
+            "net_deposits": "Net депозитов",
+            "net_payout": "Net ревеню в валюте ПП",
+            "net_payout_usd": "Net ревеню в USD",
+            "currency": "Валюта",
+            "conversion_rate": "Курс → USD",
+        }
     )
-    create_download_button("Скачать сводку по программам", summary, "partner_summary.csv")
+
+    if "Депозитов" in summary_display.columns:
+        summary_display["Депозитов"] = summary_display["Депозитов"].astype(int)
+    if "Чарджбеков" in summary_display.columns:
+        summary_display["Чарджбеков"] = summary_display["Чарджбеков"].astype(int)
+
+    st.dataframe(summary_display, use_container_width=True)
+    create_download_button("Скачать сводку по программам", summary_download, "partner_summary.csv")
+
+    chargeback_report = summary_download[summary_download["chargebacks"] > 0].copy()
+    st.subheader("Отчет по чарджбекам")
+    if chargeback_report.empty:
+        st.info("Чарджбеков не найдено для выбранных фильтров.")
+    else:
+        chargeback_report["chargebacks"] = chargeback_report["chargebacks"].astype(int)
+        chargeback_columns = [
+            "buyer",
+            "partner_program",
+            "chargebacks",
+            "chargeback_amount",
+            "chargeback_amount_usd",
+        ]
+        chargeback_download = chargeback_report[chargeback_columns]
+
+        chargeback_display = chargeback_report[chargeback_columns].rename(
+            columns={
+                "buyer": "Байер",
+                "partner_program": "Партнерская программа",
+                "chargebacks": "Чарджбеков",
+                "chargeback_amount": "Чардж в валюте ПП",
+                "chargeback_amount_usd": "Чардж в USD",
+            }
+        )
+        st.dataframe(chargeback_display, use_container_width=True)
+        create_download_button(
+            "Скачать отчет по чарджбекам",
+            chargeback_download,
+            "partner_chargebacks.csv",
+        )
 
     overall = aggregate_overall(summary)
     overall["currency"] = overall["currency"].fillna("USD").replace("", "USD").str.upper()
@@ -410,11 +460,12 @@ def render_expenses_module(sidebar: DeltaGenerator) -> None:
     by_type_display = by_type.rename(
         columns={
             "buyer": "Байер",
-            "expense_type": "Тип расхода",
+            "expense_type": "Тип",
+            "amount": "Сумма",
             "item_count": "Кол-во",
-            "amount": "Сумма, $",
         }
     )
+    by_type_display = by_type_display[["Байер", "Тип", "Сумма", "Кол-во"]]
     st.subheader("Сводка по типам расходов")
     st.dataframe(by_type_display, use_container_width=True)
     create_download_button("Скачать сводку по типам", by_type_display, "expenses_by_type.csv")
